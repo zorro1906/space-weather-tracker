@@ -1,6 +1,7 @@
 // Space weather Telegram bot: replies to /status instantly with live readings.
 // Cloudflare Worker (module syntax). Secrets: BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, optional GH_TOKEN.
 // Storm alerts themselves still come from tracker.py on GitHub Actions.
+// Deploys automatically: Cloudflare Workers Builds runs `wrangler deploy` on every push to this repo.
 
 const WIND_URL = "https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json";
 const MAG_URL = "https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json";
