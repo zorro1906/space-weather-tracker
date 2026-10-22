@@ -7,6 +7,10 @@ const MAG_URL = "https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json";
 const KP_URL = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json";
 const ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json";
 const STATE_URL = "https://raw.githubusercontent.com/zorro1906/space-weather-tracker/main/state.json";
+const OUTLOOK_URL = "https://raw.githubusercontent.com/zorro1906/space-weather-tracker/main/outlook.json";
+const SESSION_SPEED = 400;  // km/s, your session minimum (pings come from session.py on GitHub)
+const SESSION_BZ = -5;      // nT
+const QUIET = "00:00–08:00";
 
 const SPEED_MIN = 500;      // km/s
 const BZ_MAX = -10;         // nT
@@ -22,8 +26,9 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "GET") {
-      if (url.pathname === "/status" || url.pathname === "/details") {
-        const text = await statusText(Date.now(), url.pathname === "/details");
+      if (url.pathname === "/status" || url.pathname === "/details" || url.pathname === "/morning") {
+        const text = url.pathname === "/morning" ? await morningText(Date.now())
+                                                 : await statusText(Date.now(), url.pathname === "/details");
         return new Response(text, {headers: {"content-type": "text/plain; charset=utf-8"}});
       }
       return new Response("space weather bot is running");
@@ -41,10 +46,14 @@ export default {
     if (cmd === "status" || cmd === "s" || cmd === "now" || cmd === "details" || cmd === "d") {
       try { reply = await statusText(Date.now(), cmd === "details" || cmd === "d"); }
       catch (e) { reply = "Could not reach NOAA just now (" + e.message + "). Try again in a minute."; }
+    } else if (cmd === "morning" || cmd === "m" || cmd === "today") {
+      try { reply = await morningText(Date.now()); }
+      catch (e) { reply = "Could not build the outlook just now (" + e.message + "). Try again in a minute."; }
     } else if (cmd === "start" || cmd === "help") {
-      reply = "Commands:\n/status - Bz and wind at Earth now and for the next ~45 min\n/details - the full numbers\n\n" +
+      reply = "Commands:\n/morning - today's session outlook and the next 2 days\n" +
+        "/status - Bz and wind at Earth now and for the next ~45 min\n/details - the full numbers\n\n" +
         "🟢 Bz -5 or lower\n🟡 Bz -1 to -5\n⚪ Bz around 0 or north\n🌩 storm level (Bz -10 or lower and wind over 500 km/s)\n\n" +
-        "Storm alerts arrive on their own.";
+        "Storm alerts arrive on their own. Session pings (400+ km/s, Bz -5 or lower) too, except " + QUIET + ".";
     } else {
       return new Response("ok");
     }
@@ -424,4 +433,125 @@ function formatStatus(r, warn, state, now) {
     lines.push("Data: " + Math.round((now - r.dataTime) / 60000) + " min old (" + r.source + ", " + utcHM(r.dataTime) + " UTC)");
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- morning outlook
+
+function dayLabel(ms) {
+  return new Intl.DateTimeFormat("en-GB", {timeZone: TZ, weekday: "short", day: "numeric", month: "short"}).format(new Date(ms));
+}
+
+function kmRange(hs) {
+  const vs = hs.map(h => h.v);
+  const lo = Math.min.apply(null, vs);
+  const hi = Math.max.apply(null, vs);
+  return (lo === hi ? lo : lo + "–" + hi) + " km/s";
+}
+
+// Hours of the day at or above your session speed, e.g. "✅ 400+ all day (405–432 km/s)".
+function windSummary(hs) {
+  if (!hs.length) return "no forecast";
+  const good = hs.filter(h => h.v >= SESSION_SPEED);
+  if (good.length === hs.length) return "✅ " + SESSION_SPEED + "+ all day (" + kmRange(hs) + ")";
+  if (!good.length) return "❌ under " + SESSION_SPEED + " all day (" + kmRange(hs) + ")";
+  const segs = [];
+  let cur = null;
+  for (const h of hs) {
+    if (h.v < SESSION_SPEED) { cur = null; continue; }
+    if (cur && cur.end === h.t) cur.end = h.t + 3600000;
+    else { cur = {start: h.t, end: h.t + 3600000}; segs.push(cur); }
+  }
+  return "⚠️ " + SESSION_SPEED + "+ only " + segs.slice(0, 2).map(s => local(s.start) + "–" + local(s.end)).join(", ") +
+    " (" + kmRange(hs) + ")";
+}
+
+function peakBlock(bs) {
+  return bs.reduce((a, b) => (b.kp > a.kp ? b : a));
+}
+
+function blockTime(b) {
+  return local(b.t) + "–" + local(b.t + 3 * 3600000);
+}
+
+function kpLabel(v) {
+  const g = Math.round(v) - 4;
+  return "Kp " + kpNum(v) + (g >= 1 ? " (G" + g + ")" : "");
+}
+
+function activitySummary(bs) {
+  if (!bs.length) return "no forecast";
+  const peak = peakBlock(bs);
+  if (peak.kp < 3) {
+    const lo = Math.min.apply(null, bs.map(b => b.kp));
+    return "quiet all day (Kp " + kpNum(lo) + "–" + kpNum(peak.kp) + ")";
+  }
+  const level = peak.kp >= 5 ? "storm" : peak.kp >= 4 ? "active" : "unsettled";
+  return level + ", peak " + kpLabel(peak.kp) + " " + blockTime(peak);
+}
+
+function verdict(hs, bs) {
+  if (!hs.length && !bs.length) return "no forecast yet";
+  if (hs.length && !hs.some(h => h.v >= SESSION_SPEED)) return "⚪ Unlikely: wind stays under " + SESSION_SPEED;
+  const peak = bs.length ? peakBlock(bs) : null;
+  if (peak && peak.kp >= 4) return "🟢 Good chance: activity expected, best " + blockTime(peak);
+  if (peak && peak.kp >= 3) return "🟡 Possible: wind OK, some activity " + blockTime(peak);
+  return "🟡 Possible: wind OK, but nothing pushing Bz south";
+}
+
+function plainNote(note) {
+  return String(note).replace(/CH HSS/g, "coronal hole fast-wind stream").replace(/\bHSS\b/g, "fast-wind stream")
+    .replace(/\bCH\b/g, "coronal hole").replace(/\bIMF\b/g, "magnetic field");
+}
+
+function formatMorning(o, live, now) {
+  const hours = Object.keys(o.speed_hourly || {}).map(k => ({t: Date.parse(k + ":00:00Z"), v: o.speed_hourly[k]}))
+    .sort((a, b) => a.t - b.t);
+  const blocks = (o.kp_blocks || []).map(b => ({t: Date.parse(b.start), kp: b.kp})).sort((a, b) => a.t - b.t);
+  // A 3-hour block belongs to the day it starts on; today also keeps one that is still running.
+  const onDay = (day, from) => ({
+    hs: hours.filter(h => dayKey(h.t) === day && h.t + 3600000 > from),
+    bs: blocks.filter(b => b.t + 3 * 3600000 > from && (dayKey(b.t) === day || b.t <= from)),
+  });
+
+  const today = onDay(dayKey(now), now);
+  const lines = [
+    "☀️ " + dayLabel(now) + " · Session outlook",
+    "For you: " + SESSION_SPEED + "+ km/s with Bz " + SESSION_BZ + " or lower",
+    "",
+    "Wind: " + windSummary(today.hs),
+    "Activity: " + activitySummary(today.bs),
+    "Verdict: " + verdict(today.hs, today.bs),
+  ];
+  if (live) lines.push("", "Now: " + live);
+
+  // Step from local noon so a DST change can't skip or repeat a day.
+  const hour = Number(new Intl.DateTimeFormat("en-GB", {timeZone: TZ, hour: "2-digit", hour12: false}).format(new Date(now))) % 24;
+  const noon = now + (12 - hour) * 3600000;
+  const next = [];
+  for (let d = 1; d <= 2; d++) {
+    const ms = noon + d * 86400000;
+    const day = onDay(dayKey(ms), 0);
+    if (!day.hs.length && !day.bs.length) continue;
+    let line = dayLabel(ms) + ": wind " + (day.hs.length ? kmRange(day.hs) : "n/a");
+    if (day.bs.length) {
+      const peak = peakBlock(day.bs);
+      line += " · Kp up to " + kpNum(peak.kp) + (peak.kp >= 3 ? " (" + blockTime(peak) + ")" : "");
+    }
+    next.push(line);
+  }
+  if (next.length) lines.push("", "Next days:", ...next);
+  if (o.note) lines.push("", "NOAA: " + plainNote(o.note));
+  lines.push("", "Bz can't be forecast hours ahead, so you get a 🟢 ping when a window shows up (not " + QUIET + ").");
+  return lines.join("\n");
+}
+
+async function morningText(now) {
+  const [o, wind, mag] = await Promise.all([getOptional(OUTLOOK_URL), getOptional(WIND_URL), getOptional(MAG_URL)]);
+  if (!o) return "The outlook isn't ready yet (it refreshes hourly). /status works meanwhile.";
+  let live = null;
+  if (wind && mag) {
+    const r = readings(wind, mag, null, now);
+    if (r.earth) live = headline(r, now);
+  }
+  return formatMorning(o, live, now);
 }
