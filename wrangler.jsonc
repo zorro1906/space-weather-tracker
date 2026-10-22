@@ -1,0 +1,18 @@
+// Cloudflare deploy config for the Telegram bot (space-weather-bot).
+// Secrets (BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET) and GH_TOKEN live in the Cloudflare dashboard;
+// keep_vars stops a deploy from removing GH_TOKEN.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "space-weather-bot",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-22",
+  "keep_vars": true,
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
