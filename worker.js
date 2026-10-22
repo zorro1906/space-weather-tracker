@@ -1,5 +1,5 @@
 // Space weather Telegram bot: replies to /status instantly with live readings.
-// Cloudflare Worker (module syntax). Secrets: BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET.
+// Cloudflare Worker (module syntax). Secrets: BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, optional GH_TOKEN.
 // Storm alerts themselves still come from tracker.py on GitHub Actions.
 
 const WIND_URL = "https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json";
@@ -8,6 +8,7 @@ const KP_URL = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json";
 const ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json";
 const STATE_URL = "https://raw.githubusercontent.com/zorro1906/space-weather-tracker/main/state.json";
 const OUTLOOK_URL = "https://raw.githubusercontent.com/zorro1906/space-weather-tracker/main/outlook.json";
+const DISPATCH_URL = "https://api.github.com/repos/zorro1906/space-weather-tracker/actions/workflows/space-weather.yml/dispatches";
 const SESSION_SPEED = 400;  // km/s, your session minimum (pings come from session.py on GitHub)
 const SESSION_BZ = -5;      // nT
 const QUIET = "00:00–08:00";
@@ -63,6 +64,17 @@ export default {
       body: JSON.stringify({chat_id: msg.chat.id, text: reply}),
     });
     return new Response("ok");
+  },
+
+  // Cron trigger: kicks the GitHub tracker every 5 minutes, since GitHub's own schedule can lag or skip.
+  async scheduled(event, env, ctx) {
+    if (!env.GH_TOKEN) return;
+    ctx.waitUntil(fetch(DISPATCH_URL, {
+      method: "POST",
+      headers: {"Authorization": "Bearer " + env.GH_TOKEN, "Accept": "application/vnd.github+json",
+                "User-Agent": "space-weather-bot", "content-type": "application/json"},
+      body: JSON.stringify({ref: "main", inputs: {test: "false"}}),
+    }));
   },
 };
 
