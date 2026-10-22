@@ -1,5 +1,6 @@
 // Space weather Telegram bot: replies to /status instantly with live readings.
 // Cloudflare Worker (module syntax). Secrets: BOT_TOKEN, CHAT_ID, WEBHOOK_SECRET, optional GH_TOKEN.
+// KV binding SESSIONS (private): the /session log.
 // Storm alerts themselves still come from tracker.py on GitHub Actions.
 // Deploys automatically: Cloudflare Workers Builds runs `wrangler deploy` on every push to this repo.
 
@@ -48,12 +49,24 @@ export default {
     if (cmd === "status" || cmd === "s" || cmd === "now" || cmd === "details" || cmd === "d") {
       try { reply = await statusText(Date.now(), cmd === "details" || cmd === "d"); }
       catch (e) { reply = "Could not reach NOAA just now (" + e.message + "). Try again in a minute."; }
+    } else if (cmd === "session") {
+      try { reply = await logSession(env, msg.text, Date.now()); }
+      catch (e) { reply = "Could not log the session (" + e.message + "). Try again in a minute."; }
+    } else if (cmd === "sessions") {
+      try { reply = await listSessions(env); }
+      catch (e) { reply = "Could not read the session log (" + e.message + ")."; }
+    } else if (cmd === "undo") {
+      try { reply = await undoSession(env); }
+      catch (e) { reply = "Could not undo (" + e.message + ")."; }
     } else if (cmd === "morning" || cmd === "m" || cmd === "today") {
       try { reply = await morningText(Date.now()); }
       catch (e) { reply = "Could not build the outlook just now (" + e.message + "). Try again in a minute."; }
     } else if (cmd === "start" || cmd === "help") {
       reply = "Commands:\n/morning - today's session outlook and the next 2 days\n" +
-        "/status - Bz and wind at Earth now and for the next ~45 min\n/details - the full numbers\n\n" +
+        "/status - Bz and wind at Earth now and for the next ~45 min\n/details - the full numbers\n" +
+        "/session 8 warm, orbit running - log a session right after it (score 0-10, then notes)\n" +
+        "   optional: 45m for its length (default 60m), 18:30 for when it ended\n" +
+        "/sessions - your log, and south-Bz sessions vs the rest\n/undo - delete the last logged session\n\n" +
         "🟢 Bz -5 or lower\n🟡 Bz -1 to -5\n⚪ Bz around 0 or north\n🌩 storm level (Bz -10 or lower and wind over 500 km/s)\n\n" +
         "Storm alerts arrive on their own. Session pings (400+ km/s, Bz -5 or lower) too, except " + QUIET + ".";
     } else {
@@ -338,12 +351,17 @@ function kpNum(v) {
 }
 
 // Kp as a person would read it: right after a 3-hour reset, show the block that just ended.
+function kpValue(r) {
+  if (r.kp === null || r.kp === undefined) return {v: null, prev: false};
+  const prev = r.kpPrev !== null && r.kpPrev > r.kp && r.kpWindowMin < 60;
+  return {v: prev ? r.kpPrev : r.kp, prev: prev};
+}
+
 function kpText(r) {
-  if (r.kp === null || r.kp === undefined) return "Kp n/a";
-  const usePrev = r.kpPrev !== null && r.kpPrev > r.kp && r.kpWindowMin < 60;
-  const v = usePrev ? r.kpPrev : r.kp;
-  const g = Math.round(v) - 4;
-  return "Kp " + kpNum(v) + (g >= 1 ? " (G" + g + ")" : "") + (usePrev ? " (last 3 h)" : "");
+  const k = kpValue(r);
+  if (k.v === null) return "Kp n/a";
+  const g = Math.round(k.v) - 4;
+  return "Kp " + kpNum(k.v) + (g >= 1 ? " (G" + g + ")" : "") + (k.prev ? " (last 3 h)" : "");
 }
 
 function dot(w) {
@@ -567,4 +585,132 @@ async function morningText(now) {
     if (r.earth) live = headline(r, now);
   }
   return formatMorning(o, live, now);
+}
+
+// ---------------------------------------------------------------- session log
+
+const SOUTH_SPLIT = -3;  // /sessions compares sessions with median Bz at or below this vs the rest
+
+function round1(v) {
+  return v === null || v === undefined ? null : Math.round(v * 10) / 10;
+}
+
+// Most recent past moment that read HH:MM on the Prague clock.
+function lastLocalTime(hh, mm, now) {
+  const parts = new Intl.DateTimeFormat("en-GB", {timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false})
+    .format(new Date(now)).split(":").map(Number);
+  const nowMin = (parts[0] % 24) * 60 + parts[1];
+  const back = (nowMin - (hh * 60 + mm) + 1440) % 1440;
+  return Math.floor(now / 60000) * 60000 - back * 60000;
+}
+
+// "/session 8 45m 18:30 warm, orbit running" -> score, length, end time, note (all but the note optional).
+function parseSession(text, now) {
+  const words = text.trim().replace(/^\/?\S+\s*/, "").split(/\s+/).filter(Boolean);
+  const out = {score: null, minutes: 60, end: now, note: ""};
+  const rest = [];
+  for (const w of words) {
+    if (!rest.length) {
+      const sc = /^(\d{1,2})(?:\/10)?$/.exec(w);
+      const mn = /^(\d{1,3})(?:m|min)$/i.exec(w);
+      const hr = /^(\d(?:[.,]\d)?)h$/i.exec(w);
+      const at = /^@?(\d{1,2})[:.](\d{2})$/.exec(w);
+      if (sc && out.score === null && Number(sc[1]) <= 10) { out.score = Number(sc[1]); continue; }
+      if (mn) { out.minutes = Math.min(240, Math.max(5, Number(mn[1]))); continue; }
+      if (hr) { out.minutes = Math.min(240, Math.max(5, Math.round(Number(hr[1].replace(",", ".")) * 60))); continue; }
+      if (at && Number(at[1]) < 24 && Number(at[2]) < 60) { out.end = lastLocalTime(Number(at[1]), Number(at[2]), now); continue; }
+    }
+    rest.push(w);
+  }
+  out.note = rest.join(" ").slice(0, 300);
+  return out;
+}
+
+// What reached Earth during the session, from the propagated satellite data.
+function windowStats(windRows, magRows, from, to) {
+  const win = dropOvertaken(buildSamples(windRows, magRows)).filter(s => s.arrival > from && s.arrival <= to);
+  if (win.length < 5) return null;
+  const bzs = win.map(s => s.bz);
+  const pct = f => Math.round(100 * win.filter(f).length / win.length);
+  return {
+    bz: round1(median(bzs)),
+    lo: round1(Math.min.apply(null, bzs)),
+    south: pct(s => s.bz <= SESSION_BZ),
+    good: pct(s => s.bz <= SESSION_BZ && s.speed >= SESSION_SPEED),
+    v: Math.round(median(win.map(s => s.speed))),
+  };
+}
+
+async function logSession(env, text, now) {
+  if (!env.SESSIONS) return "Session storage isn't connected yet.";
+  const p = parseSession(text, now);
+  const [wind, mag, kp] = await Promise.all([getJson(WIND_URL), getJson(MAG_URL), getOptional(KP_URL)]);
+  const st = windowStats(wind, mag, p.end - p.minutes * 60000, p.end);
+  const k = kpValue(readings(wind, mag, kp, p.end));
+  const meta = {s: p.score, m: p.minutes, kp: round1(k.v), lg: now};
+  if (st) Object.assign(meta, st);
+  const key = "session:" + new Date(p.end).toISOString() + ":" + now;
+  await env.SESSIONS.put(key, JSON.stringify({end: new Date(p.end).toISOString(), logged: new Date(now).toISOString(),
+    score: p.score, minutes: p.minutes, note: p.note, stats: st, kp: meta.kp}), {metadata: meta});
+
+  const lines = ["✅ Session logged" + (p.score === null ? " (no score; start with a number like /session 8 ...)" : " · " + p.score + "/10")];
+  const span = local(p.end - p.minutes * 60000) + "–" + local(p.end);
+  if (st) {
+    lines.push(span + " at Earth: Bz median " + signed(st.bz) + " (lowest " + signed(st.lo) + ")");
+    lines.push("Bz -5 or lower " + st.south + "% of the time · wind " + st.v + " km/s · " + (meta.kp === null ? "Kp n/a" : "Kp " + kpNum(meta.kp)));
+  } else {
+    lines.push(span + ": no satellite data for that window, the note is saved anyway");
+  }
+  if (p.note) lines.push("Note: " + p.note);
+  lines.push("/sessions shows the log · /undo removes this one");
+  return lines.join("\n");
+}
+
+async function sessionKeys(env) {
+  const keys = [];
+  let cursor = undefined;
+  for (let i = 0; i < 20; i++) {
+    const page = await env.SESSIONS.list({prefix: "session:", cursor: cursor});
+    keys.push(...page.keys);
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  return keys;
+}
+
+function average(rows) {
+  return (rows.reduce((a, r) => a + r.s, 0) / rows.length).toFixed(1);
+}
+
+async function listSessions(env) {
+  if (!env.SESSIONS) return "Session storage isn't connected yet.";
+  const rows = (await sessionKeys(env)).map(k => Object.assign({t: Date.parse(k.name.slice(8, 32))}, k.metadata || {}))
+    .sort((a, b) => a.t - b.t);
+  if (!rows.length) return "No sessions logged yet. Right after a session send e.g.\n/session 8 warm, orbit running";
+  const lines = ["📒 Sessions logged: " + rows.length, ""];
+  for (const r of rows.slice(-10).reverse()) {
+    const bz = typeof r.bz === "number" ? dot({bz: r.bz, speed: r.v || 0}) + " Bz " + signed(r.bz) + " · " + r.south + "% at -5" : "no data";
+    lines.push(dayLabel(r.t) + " " + local(r.t) + " · " + (typeof r.s === "number" ? r.s + "/10" : "–") + " · " + bz);
+  }
+  const scored = rows.filter(r => typeof r.s === "number" && typeof r.bz === "number");
+  const south = scored.filter(r => r.bz <= SOUTH_SPLIT);
+  const rest = scored.filter(r => r.bz > SOUTH_SPLIT);
+  lines.push("", "South Bz sessions (median " + SOUTH_SPLIT + " or lower) vs the rest:");
+  if (south.length >= 3 && rest.length >= 3) {
+    lines.push("South: " + south.length + " sessions, average " + average(south) + "/10");
+    lines.push("Rest: " + rest.length + " sessions, average " + average(rest) + "/10");
+  } else {
+    lines.push("Needs 3+ scored sessions in each group (so far " + south.length + " south, " + rest.length + " other).");
+  }
+  return lines.join("\n");
+}
+
+async function undoSession(env) {
+  if (!env.SESSIONS) return "Session storage isn't connected yet.";
+  const keys = await sessionKeys(env);
+  if (!keys.length) return "Nothing to undo.";
+  const last = keys.reduce((a, b) => (((b.metadata || {}).lg || 0) >= ((a.metadata || {}).lg || 0) ? b : a)).name;
+  await env.SESSIONS.delete(last);
+  const t = Date.parse(last.slice(8, 32));
+  return "🗑 Removed the session from " + dayLabel(t) + " " + local(t) + ".";
 }
