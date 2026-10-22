@@ -35,12 +35,28 @@ jobs:
           NOAA_MIN_G: "2"
         run: python3 tracker.py --state state.json ${{ inputs.test && '--test' || '' }}
 
+      - name: Session pings and morning outlook
+        continue-on-error: true   # never let this block the storm alerts above
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TZ_NAME: "Europe/Prague"
+          SESSION_SPEED_MIN: "400"
+          SESSION_BZ_MAX: "-5"
+          QUIET_START_HOUR: "0"
+          QUIET_END_HOUR: "8"
+        run: python3 session.py --state session.json --outlook outlook.json
+
       - name: Save state if it changed
         run: |
-          if [ -n "$(git status --porcelain -- state.json)" ]; then
+          if [ -n "$(git status --porcelain -- state.json session.json outlook.json)" ]; then
             git config user.name "space-weather-bot"
             git config user.email "space-weather-bot@users.noreply.github.com"
-            git add state.json
-            git commit -m "Update storm state"
+            for f in state.json session.json outlook.json; do
+              if [ -e "$f" ]; then git add "$f"; fi
+            done
+            git commit -m "Update state"
+            git pull --rebase --quiet
             git push
           fi
