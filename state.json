@@ -1,6 +1,8 @@
 {
+  "eta": "2026-10-31T18:11:06.417112+00:00",
   "noaa": {
     "seen": []
   },
-  "phase": "idle"
+  "phase": "incoming",
+  "strength": 1
 }
