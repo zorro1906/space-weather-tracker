@@ -1,8 +1,11 @@
 {
-  "eta": "2026-10-31T18:11:06.417112+00:00",
+  "clear_since": null,
+  "g": 0,
   "noaa": {
     "seen": []
   },
-  "phase": "incoming",
+  "peak_kp": 1.0,
+  "phase": "here",
+  "started": "2026-10-31T18:11:06.417112+00:00",
   "strength": 1
 }
