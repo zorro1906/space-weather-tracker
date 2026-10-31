@@ -107,6 +107,7 @@ Set as environment variables (on GitHub, edit the `env:` block in the workflow):
 | `TZ_NAME` | Europe/Prague | Time zone for arrival times |
 | `L1_DISTANCE_KM` | 1350000 | Travel distance used for the arrival estimate |
 | `STALE_MINUTES` | 30 | Ignore data older than this (satellite outage) |
+| `BACKUP_AFTER_MINUTES` | 15 | Switch to a backup satellite when NOAA's active one is this far behind |
 
 **ntfy instead of Telegram:** install the free ntfy app, subscribe to a hard-to-guess topic name, and set `NTFY_TOPIC` instead of the two Telegram values.
 
@@ -118,4 +119,4 @@ Set as environment variables (on GitHub, edit the `env:` block in the workflow):
 - NOAA watches and warnings: https://services.swpc.noaa.gov/products/alerts.json
 - G scale: https://www.swpc.noaa.gov/noaa-scales-explanation
 
-These feeds carry several spacecraft at once; the tracker uses only the one NOAA flags as active.
+These feeds carry several spacecraft at once (SOLAR1, IMAP, ACE, sometimes DSCOVR). The tracker uses the one NOAA flags as active. When that one stops reporting for 15+ minutes (an outage or a maneuver), it switches to the backup with the freshest data in both feeds, keeping wind and field from the same spacecraft, and switches back once the active satellite is current again. /status then shows "using backup" and the satellite's name.

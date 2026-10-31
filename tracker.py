@@ -51,6 +51,10 @@ ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json"
 
 G_NAMES = {1: "Minor", 2: "Moderate", 3: "Strong", 4: "Severe", 5: "Extreme"}
 
+# Spacecraft at L1 in the real-time feeds. NOAA flags one as active; the others
+# are backups, used only when the active one stops reporting. Tie-break order.
+SOURCE_PREFERENCE = ("SOLAR1", "DSCOVR", "IMAP", "ACE")
+
 
 def env_float(name: str, default: float) -> float:
     value = os.environ.get(name, "").strip()
@@ -64,6 +68,7 @@ def load_config() -> dict:
         "avg_minutes": env_float("AVG_MINUTES", 10.0),       # median window
         "clear_minutes": env_float("CLEAR_MINUTES", 30.0),   # calm at Earth before "over"
         "stale_minutes": env_float("STALE_MINUTES", 30.0),   # ignore older data
+        "backup_after_minutes": env_float("BACKUP_AFTER_MINUTES", 15.0),  # active satellite this far behind: use a backup
         "cancel_minutes": env_float("CANCEL_MINUTES", 30.0), # grace after ETA before "cancelled"
         "distance_km": env_float("L1_DISTANCE_KM", 1.35e6),  # L1 to bow shock
         "noaa_min_g": int(env_float("NOAA_MIN_G", 2)),       # relay NOAA watches/warnings from this G
@@ -114,6 +119,50 @@ def active_rows(rows, field: str) -> list:
     return active or rows
 
 
+def newest_by_source(rows, field: str) -> dict:
+    """Newest time per spacecraft, among rows that carry the given field."""
+    newest = {}
+    for r in rows or []:
+        if not isinstance(r, dict) or r.get(field) is None or not r.get("time_tag"):
+            continue
+        source, t = r.get("source") or "?", parse_time(r["time_tag"])
+        if source not in newest or t > newest[source]:
+            newest[source] = t
+    return newest
+
+
+def pick_source(wind_rows, mag_rows, now: datetime, cfg: dict):
+    """(spacecraft to use, True if it is a backup).
+
+    NOAA's active satellite while its data is fresh. When it stops reporting
+    (an outage or a maneuver), the satellite with the freshest data in both
+    feeds, so wind and field always come from the same spacecraft. None when
+    no satellite has fresh data; the caller then keeps NOAA's active rows.
+    """
+    wind_new = newest_by_source(wind_rows, "proton_speed")
+    mag_new = newest_by_source(mag_rows, "bz_gsm")
+    both = {s: min(wind_new[s], mag_new[s]) for s in wind_new.keys() & mag_new.keys()}
+    active = next((r.get("source") for r in list(mag_rows or []) + list(wind_rows or [])
+                   if isinstance(r, dict) and r.get("active") is True), None)
+    backup_after = timedelta(minutes=cfg.get("backup_after_minutes", 15.0))
+    if active in both and now - both[active] <= backup_after:
+        return active, False
+    fresh = {s: t for s, t in both.items() if now - t <= timedelta(minutes=cfg["stale_minutes"])}
+    if not fresh:
+        return None, False
+    rank = {s: i for i, s in enumerate(SOURCE_PREFERENCE)}
+    best = max(fresh, key=lambda s: (fresh[s], -rank.get(s, len(rank))))
+    return best, active is not None and best != active
+
+
+def rows_for(rows, field: str, source) -> list:
+    """Rows from the chosen spacecraft; NOAA's active rows when none was chosen."""
+    if source is None:
+        return active_rows(rows, field)
+    return [r for r in (rows or []) if isinstance(r, dict) and r.get(field) is not None
+            and (r.get("source") or "?") == source]
+
+
 def mean(values):
     values = [v for v in values if v is not None]
     return sum(values) / len(values) if values else None
@@ -127,17 +176,19 @@ def median(values):
     return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
 
 
-def build_samples(wind_rows, mag_rows, cfg) -> list:
+def build_samples(wind_rows, mag_rows, cfg, now: datetime | None = None) -> list:
     """Join wind and field by minute; add each sample's estimated arrival at Earth.
 
-    Travel time uses the 10-minute running median speed, so a brief speed
-    spike can't make a few samples jump ahead of the rest.
+    Uses NOAA's active satellite, or a backup when the active one has gone
+    quiet (see pick_source). Travel time uses the 10-minute running median
+    speed, so a brief speed spike can't make a few samples jump ahead of the rest.
     """
+    source, backup = pick_source(wind_rows, mag_rows, now or datetime.now(timezone.utc), cfg)
     wind = {}
-    for r in active_rows(wind_rows, "proton_speed"):
+    for r in rows_for(wind_rows, "proton_speed", source):
         wind[minute_key(parse_time(r["time_tag"]))] = r
     samples = []
-    for r in active_rows(mag_rows, "bz_gsm"):
+    for r in rows_for(mag_rows, "bz_gsm", source):
         t = minute_key(parse_time(r["time_tag"]))
         w = wind.get(t)
         if w is None or not w.get("proton_speed"):
@@ -149,6 +200,7 @@ def build_samples(wind_rows, mag_rows, cfg) -> list:
             "bt": float(r["bt"]) if r.get("bt") is not None else None,
             "density": float(w["proton_density"]) if w.get("proton_density") is not None else None,
             "source": r.get("source", "?"),
+            "backup": backup,
         })
     samples.sort(key=lambda s: s["t"])
 
@@ -213,10 +265,10 @@ def latest_kp(rows):
 
 
 def build_readings(wind_rows, mag_rows, kp_rows, now: datetime, cfg: dict) -> dict:
-    samples = build_samples(wind_rows, mag_rows, cfg)
+    samples = build_samples(wind_rows, mag_rows, cfg, now)
     avg = timedelta(minutes=cfg["avg_minutes"])
     kp, kp_index = latest_kp(kp_rows)
-    readings = {"l1": None, "earth": None, "eta": None, "data_time": None, "source": None,
+    readings = {"l1": None, "earth": None, "eta": None, "data_time": None, "source": None, "backup": False,
                 "kp": kp, "kp_index": kp_index, "noaa": [], "avg_minutes": cfg["avg_minutes"]}
     if not samples:
         return readings
@@ -224,6 +276,7 @@ def build_readings(wind_rows, mag_rows, kp_rows, now: datetime, cfg: dict) -> di
     newest = samples[-1]["t"]
     readings["data_time"] = newest
     readings["source"] = samples[-1]["source"]
+    readings["backup"] = samples[-1].get("backup", False)
 
     # What the satellite sees now (reaches Earth later)
     l1_window = [s for s in samples if s["t"] > newest - avg]
@@ -549,7 +602,7 @@ def format_status(r: dict) -> str:
         return f"{name}: {fmt(w['speed'], 0, ' km/s')}, Bz {fmt(w['bz'], 1, ' nT')}"
     when = f"{r['data_time']:%Y-%m-%d %H:%M} UTC" if r.get("data_time") else "no data"
     return (f"{part('Satellite', r['l1'])} | {part('Arriving at Earth', r['earth'])} | "
-            f"Kp {fmt(r['kp'], 2)} | data {when} ({r.get('source')})")
+            f"Kp {fmt(r['kp'], 2)} | data {when} ({r.get('source')}{', backup' if r.get('backup') else ''})")
 
 
 # --------------------------------------------------------------------------

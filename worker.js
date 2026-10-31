@@ -20,6 +20,9 @@ const BZ_MAX = -10;         // nT
 const AVG_MIN = 10;         // median window, minutes
 const BIN_MIN = 10;         // Earth forecast block, minutes
 const DIST_KM = 1.35e6;     // L1 to bow shock
+const STALE_MIN = 30;       // ignore satellite data older than this
+const BACKUP_AFTER_MIN = 15; // active satellite this far behind: switch to a backup
+const SOURCE_PREF = ["SOLAR1", "DSCOVR", "IMAP", "ACE"];  // tie-break among backups
 const MIN_DRIVER = SPEED_MIN * Math.abs(BZ_MAX) / 1000;  // 5 mV/m, your minimum
 const TZ = "Europe/Prague";
 const G_NAMES = {1: "Minor", 2: "Moderate", 3: "Strong", 4: "Severe", 5: "Extreme"};
@@ -126,11 +129,49 @@ function activeRows(rows, field) {
   return active.length ? active : all;
 }
 
-function buildSamples(windRows, magRows) {
+function newestBySource(rows, field) {
+  const out = {};
+  for (const r of rows || []) {
+    if (!r || typeof r !== "object" || r[field] === null || r[field] === undefined || !r.time_tag) continue;
+    const s = r.source || "?";
+    const t = parseTag(r.time_tag);
+    if (!(s in out) || t > out[s]) out[s] = t;
+  }
+  return out;
+}
+
+// NOAA's active satellite while its data is fresh. When it stops reporting (outage, maneuver),
+// the satellite with the freshest data in both feeds, so wind and field come from one spacecraft.
+// source null: nothing fresh anywhere, keep NOAA's active rows.
+function pickSource(windRows, magRows, now) {
+  const w = newestBySource(windRows, "proton_speed");
+  const m = newestBySource(magRows, "bz_gsm");
+  const both = {};
+  for (const s of Object.keys(m)) if (s in w) both[s] = Math.min(w[s], m[s]);
+  const flagged = (magRows || []).concat(windRows || []).find(r => r && r.active === true);
+  const active = flagged ? (flagged.source || "?") : null;
+  if (active !== null && active in both && now - both[active] <= BACKUP_AFTER_MIN * 60000) {
+    return {source: active, backup: false};
+  }
+  const fresh = Object.keys(both).filter(s => now - both[s] <= STALE_MIN * 60000);
+  if (!fresh.length) return {source: null, backup: false};
+  const rank = s => (SOURCE_PREF.indexOf(s) < 0 ? SOURCE_PREF.length : SOURCE_PREF.indexOf(s));
+  fresh.sort((a, b) => (both[b] - both[a]) || (rank(a) - rank(b)));
+  return {source: fresh[0], backup: active !== null && fresh[0] !== active};
+}
+
+function rowsFor(rows, field, source) {
+  if (source === null) return activeRows(rows, field);
+  return (rows || []).filter(r => r && typeof r === "object" && r[field] !== null && r[field] !== undefined &&
+                                  (r.source || "?") === source);
+}
+
+function buildSamples(windRows, magRows, now) {
+  const pick = pickSource(windRows, magRows, now === undefined ? Date.now() : now);
   const wind = new Map();
-  for (const r of activeRows(windRows, "proton_speed")) wind.set(Math.floor(parseTag(r.time_tag) / 60000), r);
+  for (const r of rowsFor(windRows, "proton_speed", pick.source)) wind.set(Math.floor(parseTag(r.time_tag) / 60000), r);
   const samples = [];
-  for (const r of activeRows(magRows, "bz_gsm")) {
+  for (const r of rowsFor(magRows, "bz_gsm", pick.source)) {
     const minute = Math.floor(parseTag(r.time_tag) / 60000);
     const w = wind.get(minute);
     if (!w || !w.proton_speed) continue;
@@ -140,6 +181,7 @@ function buildSamples(windRows, magRows) {
       bz: Number(r.bz_gsm),
       bt: r.bt === null || r.bt === undefined ? null : Number(r.bt),
       source: r.source || "?",
+      backup: pick.backup,
     });
   }
   samples.sort((a, b) => a.t - b.t);
@@ -172,9 +214,9 @@ function summarize(win) {
 }
 
 function readings(windRows, magRows, kpRows, now) {
-  const samples = buildSamples(windRows, magRows);
+  const samples = buildSamples(windRows, magRows, now);
   const avg = AVG_MIN * 60000;
-  const out = {l1: null, earth: null, dataTime: null, source: null, kp: null, kpIndex: null,
+  const out = {l1: null, earth: null, dataTime: null, source: null, backup: false, kp: null, kpIndex: null,
                kpPrev: null, kpWindowMin: null, l1Eta: null, blocks: []};
   const kpOk = (kpRows || []).filter(r => r && r.estimated_kp !== null && r.estimated_kp !== undefined);
   if (kpOk.length) {
@@ -194,6 +236,7 @@ function readings(windRows, magRows, kpRows, now) {
   const newest = samples[samples.length - 1].t;
   out.dataTime = newest;
   out.source = samples[samples.length - 1].source;
+  out.backup = samples[samples.length - 1].backup === true;
   out.l1 = summarize(samples.filter(s => s.t > newest - avg));
   const prop = dropOvertaken(samples);
   let atEarth = prop.filter(s => s.arrival > now - avg && s.arrival <= now);
@@ -426,6 +469,7 @@ function formatSimple(r, warn, state, now) {
   if (r.dataTime && now - r.dataTime > 15 * 60000) {
     lines.push("⚠️ Satellite data is " + Math.round((now - r.dataTime) / 60000) + " min old");
   }
+  if (r.backup) lines.push("🔁 Main satellite feed is down · using backup " + r.source);
   return lines.join("\n");
 }
 
@@ -461,7 +505,8 @@ function formatStatus(r, warn, state, now) {
   lines.push(warn ? "NOAA: K" + warn.k + " warning (" + gLabel(warn.k - 4) + ") until " + local(warn.validTo, true)
                   : "NOAA: no active K-index warning");
   if (r.dataTime) {
-    lines.push("Data: " + Math.round((now - r.dataTime) / 60000) + " min old (" + r.source + ", " + utcHM(r.dataTime) + " UTC)");
+    lines.push("Data: " + Math.round((now - r.dataTime) / 60000) + " min old (" + r.source + (r.backup ? ", backup" : "") +
+               ", " + utcHM(r.dataTime) + " UTC)");
   }
   return lines.join("\n");
 }
