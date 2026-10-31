@@ -2,7 +2,11 @@
   "clear_since": null,
   "g": 0,
   "noaa": {
-    "seen": []
+    "seen": [
+      "K06W-673"
+    ],
+    "warn_g": 2,
+    "warn_time": "2026-10-31T19:10:36.997322+00:00"
   },
   "peak_kp": 1.67,
   "phase": "here",
