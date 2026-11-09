@@ -120,3 +120,7 @@ Set as environment variables (on GitHub, edit the `env:` block in the workflow):
 - G scale: https://www.swpc.noaa.gov/noaa-scales-explanation
 
 These feeds carry several spacecraft at once (SOLAR1, IMAP, ACE, sometimes DSCOVR). The tracker uses the one NOAA flags as active. When that one stops reporting for 15+ minutes (an outage or a maneuver), it switches to the backup with the freshest data in both feeds, keeping wind and field from the same spacecraft, and switches back once the active satellite is current again. /status then shows "using backup" and the satellite's name.
+
+The other satellites also fill gaps. Any minute the main satellite is missing, inside its data or because its feed runs 3+ minutes behind a backup, is taken from the freshest other satellite, still with wind and field from the same spacecraft. So the forecast reaches as far ahead as any satellite can see. /status shows "Gaps filled from …" when 3+ filled minutes are in play.
+
+How far ahead it can see is set by physics, not by the satellites: they all sit at L1, about 1.35 million km out, so the forecast covers roughly the wind's travel time from there (about 56 min at 400 km/s, 45 min at 500, 32 min at 700), minus a few minutes of data delay. A full hour is only possible when the wind is slower than about 375 km/s.
