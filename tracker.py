@@ -52,8 +52,10 @@ ALERTS_URL = "https://services.swpc.noaa.gov/products/alerts.json"
 G_NAMES = {1: "Minor", 2: "Moderate", 3: "Strong", 4: "Severe", 5: "Extreme"}
 
 # Spacecraft at L1 in the real-time feeds. NOAA flags one as active; the others
-# are backups, used only when the active one stops reporting. Tie-break order.
+# are backups, used when the active one stops reporting and to fill its gaps. Tie-break order.
 SOURCE_PREFERENCE = ("SOLAR1", "DSCOVR", "IMAP", "ACE")
+FILL_TAIL_MINUTES = 3  # extend past the main satellite's newest minute only if a backup is this much fresher
+FILL_NOTE_MINUTES = 3  # mention filling once at least this many filled minutes are in play
 
 
 def env_float(name: str, default: float) -> float:
@@ -176,31 +178,70 @@ def median(values):
     return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
 
 
+def pair_minutes(wind_rows, mag_rows) -> dict:
+    """{minute: (wind row, field row)} where both feeds have that minute."""
+    wind = {}
+    for r in wind_rows:
+        wind[minute_key(parse_time(r["time_tag"]))] = r
+    out = {}
+    for r in mag_rows:
+        t = minute_key(parse_time(r["time_tag"]))
+        w = wind.get(t)
+        if w is not None and w.get("proton_speed"):
+            out[t] = (w, r)
+    return out
+
+
+def pairs_by_source(wind_rows, mag_rows) -> dict:
+    """{spacecraft: {minute: (wind row, field row)}}, wind and field from the same spacecraft."""
+    sources = {(r.get("source") or "?") for r in (mag_rows or []) if isinstance(r, dict)}
+    return {s: pair_minutes(rows_for(wind_rows, "proton_speed", s), rows_for(mag_rows, "bz_gsm", s))
+            for s in sources}
+
+
 def build_samples(wind_rows, mag_rows, cfg, now: datetime | None = None) -> list:
     """Join wind and field by minute; add each sample's estimated arrival at Earth.
 
     Uses NOAA's active satellite, or a backup when the active one has gone
-    quiet (see pick_source). Travel time uses the 10-minute running median
-    speed, so a brief speed spike can't make a few samples jump ahead of the rest.
+    quiet (see pick_source). Minutes the main satellite is missing (gaps, or a
+    feed running a few minutes behind) are filled from the other satellites,
+    freshest first, so the forecast reaches as far ahead as any of them can see.
+    Each minute's wind and field still come from one spacecraft. Travel time
+    uses the 10-minute running median speed, so a brief speed spike can't make
+    a few samples jump ahead of the rest.
     """
     source, backup = pick_source(wind_rows, mag_rows, now or datetime.now(timezone.utc), cfg)
-    wind = {}
-    for r in rows_for(wind_rows, "proton_speed", source):
-        wind[minute_key(parse_time(r["time_tag"]))] = r
+    if source is None:
+        # Nothing fresh anywhere: NOAA's active rows, as before
+        chosen = {t: (w, m, False) for t, (w, m) in
+                  pair_minutes(active_rows(wind_rows, "proton_speed"), active_rows(mag_rows, "bz_gsm")).items()}
+    else:
+        pairs = pairs_by_source(wind_rows, mag_rows)
+        chosen = {t: (w, m, False) for t, (w, m) in pairs.get(source, {}).items()}
+        main_newest = max(chosen) if chosen else None
+        rank = {s: i for i, s in enumerate(SOURCE_PREFERENCE)}
+        others = sorted((s for s in pairs if s != source and pairs[s]),
+                        key=lambda s: (-max(pairs[s]).timestamp(), rank.get(s, len(rank))))
+        for s in others:
+            # Past the main satellite's newest minute only when this one is clearly fresher,
+            # so a one-minute lead doesn't splice in a different spacecraft every run.
+            tail_ok = main_newest is None or max(pairs[s]) - main_newest >= timedelta(minutes=FILL_TAIL_MINUTES)
+            for t, (w, m) in pairs[s].items():
+                if t in chosen or (main_newest is not None and t > main_newest and not tail_ok):
+                    continue
+                chosen[t] = (w, m, True)
     samples = []
-    for r in rows_for(mag_rows, "bz_gsm", source):
-        t = minute_key(parse_time(r["time_tag"]))
-        w = wind.get(t)
-        if w is None or not w.get("proton_speed"):
-            continue
+    for t, (w, r, filled) in chosen.items():
         samples.append({
             "t": t,
             "speed": float(w["proton_speed"]),
             "bz": float(r["bz_gsm"]),
             "bt": float(r["bt"]) if r.get("bt") is not None else None,
             "density": float(w["proton_density"]) if w.get("proton_density") is not None else None,
-            "source": r.get("source", "?"),
+            "source": r.get("source") or "?",
+            "primary": source or (r.get("source") or "?"),
             "backup": backup,
+            "filled": filled,
         })
     samples.sort(key=lambda s: s["t"])
 
@@ -269,14 +310,17 @@ def build_readings(wind_rows, mag_rows, kp_rows, now: datetime, cfg: dict) -> di
     avg = timedelta(minutes=cfg["avg_minutes"])
     kp, kp_index = latest_kp(kp_rows)
     readings = {"l1": None, "earth": None, "eta": None, "data_time": None, "source": None, "backup": False,
-                "kp": kp, "kp_index": kp_index, "noaa": [], "avg_minutes": cfg["avg_minutes"]}
+                "filled": [], "kp": kp, "kp_index": kp_index, "noaa": [], "avg_minutes": cfg["avg_minutes"]}
     if not samples:
         return readings
 
     newest = samples[-1]["t"]
     readings["data_time"] = newest
-    readings["source"] = samples[-1]["source"]
+    readings["source"] = samples[-1]["primary"]
     readings["backup"] = samples[-1].get("backup", False)
+    # Satellites that filled gaps in what is reaching Earth now or still on its way
+    filled = [s for s in samples if s["filled"] and s["arrival"] > now - avg]
+    readings["filled"] = sorted({s["source"] for s in filled}) if len(filled) >= FILL_NOTE_MINUTES else []
 
     # What the satellite sees now (reaches Earth later)
     l1_window = [s for s in samples if s["t"] > newest - avg]
@@ -602,7 +646,8 @@ def format_status(r: dict) -> str:
         return f"{name}: {fmt(w['speed'], 0, ' km/s')}, Bz {fmt(w['bz'], 1, ' nT')}"
     when = f"{r['data_time']:%Y-%m-%d %H:%M} UTC" if r.get("data_time") else "no data"
     return (f"{part('Satellite', r['l1'])} | {part('Arriving at Earth', r['earth'])} | "
-            f"Kp {fmt(r['kp'], 2)} | data {when} ({r.get('source')}{', backup' if r.get('backup') else ''})")
+            f"Kp {fmt(r['kp'], 2)} | data {when} ({r.get('source')}{', backup' if r.get('backup') else ''}"
+            f"{', gaps filled from ' + '/'.join(r['filled']) if r.get('filled') else ''})")
 
 
 # --------------------------------------------------------------------------
