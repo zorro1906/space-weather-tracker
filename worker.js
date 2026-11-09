@@ -23,6 +23,8 @@ const DIST_KM = 1.35e6;     // L1 to bow shock
 const STALE_MIN = 30;       // ignore satellite data older than this
 const BACKUP_AFTER_MIN = 15; // active satellite this far behind: switch to a backup
 const SOURCE_PREF = ["SOLAR1", "DSCOVR", "IMAP", "ACE"];  // tie-break among backups
+const FILL_TAIL_MIN = 3;    // extend past the main satellite's newest minute only if a backup is this much fresher
+const FILL_NOTE_MIN = 3;    // mention filling once at least this many filled minutes are in play
 const MIN_DRIVER = SPEED_MIN * Math.abs(BZ_MAX) / 1000;  // 5 mV/m, your minimum
 const TZ = "Europe/Prague";
 const G_NAMES = {1: "Minor", 2: "Moderate", 3: "Strong", 4: "Severe", 5: "Extreme"};
@@ -166,22 +168,61 @@ function rowsFor(rows, field, source) {
                                   (r.source || "?") === source);
 }
 
-function buildSamples(windRows, magRows, now) {
-  const pick = pickSource(windRows, magRows, now === undefined ? Date.now() : now);
+// minute -> [wind row, field row], where both feeds have that minute
+function pairMinutes(windRows, magRows) {
   const wind = new Map();
-  for (const r of rowsFor(windRows, "proton_speed", pick.source)) wind.set(Math.floor(parseTag(r.time_tag) / 60000), r);
-  const samples = [];
-  for (const r of rowsFor(magRows, "bz_gsm", pick.source)) {
+  for (const r of windRows) wind.set(Math.floor(parseTag(r.time_tag) / 60000), r);
+  const out = new Map();
+  for (const r of magRows) {
     const minute = Math.floor(parseTag(r.time_tag) / 60000);
     const w = wind.get(minute);
-    if (!w || !w.proton_speed) continue;
+    if (w && w.proton_speed) out.set(minute, [w, r]);
+  }
+  return out;
+}
+
+// NOAA's active satellite (or a backup when it has gone quiet, see pickSource). Minutes the main
+// satellite is missing (gaps, or a feed running a few minutes behind) are filled from the other
+// satellites, freshest first, so the forecast reaches as far ahead as any of them can see.
+// Each minute's wind and field still come from one spacecraft.
+function buildSamples(windRows, magRows, now) {
+  const pick = pickSource(windRows, magRows, now === undefined ? Date.now() : now);
+  const chosen = new Map();
+  if (pick.source === null) {
+    for (const [m, p] of pairMinutes(activeRows(windRows, "proton_speed"), activeRows(magRows, "bz_gsm"))) {
+      chosen.set(m, [p[0], p[1], false]);
+    }
+  } else {
+    const sources = new Set((magRows || []).filter(r => r && typeof r === "object").map(r => r.source || "?"));
+    const pairs = new Map();
+    for (const s of sources) pairs.set(s, pairMinutes(rowsFor(windRows, "proton_speed", s), rowsFor(magRows, "bz_gsm", s)));
+    for (const [m, p] of pairs.get(pick.source) || new Map()) chosen.set(m, [p[0], p[1], false]);
+    const mainNewest = chosen.size ? Math.max.apply(null, Array.from(chosen.keys())) : null;
+    const rank = s => (SOURCE_PREF.indexOf(s) < 0 ? SOURCE_PREF.length : SOURCE_PREF.indexOf(s));
+    const newest = s => Math.max.apply(null, Array.from(pairs.get(s).keys()));
+    const others = Array.from(pairs.keys()).filter(s => s !== pick.source && pairs.get(s).size)
+      .sort((a, b) => (newest(b) - newest(a)) || (rank(a) - rank(b)));
+    for (const s of others) {
+      // Past the main satellite's newest minute only when this one is clearly fresher,
+      // so a one-minute lead doesn't splice in a different spacecraft every run.
+      const tailOk = mainNewest === null || newest(s) - mainNewest >= FILL_TAIL_MIN;
+      for (const [m, p] of pairs.get(s)) {
+        if (chosen.has(m) || (mainNewest !== null && m > mainNewest && !tailOk)) continue;
+        chosen.set(m, [p[0], p[1], true]);
+      }
+    }
+  }
+  const samples = [];
+  for (const [minute, [w, r, filled]] of chosen) {
     samples.push({
       t: minute * 60000,
       speed: Number(w.proton_speed),
       bz: Number(r.bz_gsm),
       bt: r.bt === null || r.bt === undefined ? null : Number(r.bt),
       source: r.source || "?",
+      primary: pick.source === null ? (r.source || "?") : pick.source,
       backup: pick.backup,
+      filled: filled,
     });
   }
   samples.sort((a, b) => a.t - b.t);
@@ -216,7 +257,7 @@ function summarize(win) {
 function readings(windRows, magRows, kpRows, now) {
   const samples = buildSamples(windRows, magRows, now);
   const avg = AVG_MIN * 60000;
-  const out = {l1: null, earth: null, dataTime: null, source: null, backup: false, kp: null, kpIndex: null,
+  const out = {l1: null, earth: null, dataTime: null, source: null, backup: false, filled: [], kp: null, kpIndex: null,
                kpPrev: null, kpWindowMin: null, l1Eta: null, blocks: []};
   const kpOk = (kpRows || []).filter(r => r && r.estimated_kp !== null && r.estimated_kp !== undefined);
   if (kpOk.length) {
@@ -235,8 +276,11 @@ function readings(windRows, magRows, kpRows, now) {
   if (!samples.length) return out;
   const newest = samples[samples.length - 1].t;
   out.dataTime = newest;
-  out.source = samples[samples.length - 1].source;
+  out.source = samples[samples.length - 1].primary;
   out.backup = samples[samples.length - 1].backup === true;
+  // Satellites that filled gaps in what is reaching Earth now or still on its way
+  const filled = samples.filter(s => s.filled && s.arrival > now - avg);
+  out.filled = filled.length >= FILL_NOTE_MIN ? Array.from(new Set(filled.map(s => s.source))).sort() : [];
   out.l1 = summarize(samples.filter(s => s.t > newest - avg));
   const prop = dropOvertaken(samples);
   let atEarth = prop.filter(s => s.arrival > now - avg && s.arrival <= now);
@@ -458,7 +502,9 @@ function formatSimple(r, warn, state, now) {
     lines.push("");
     lines.push("Next " + minsUntil(last.to, now) + " min:");
     for (const b of r.blocks) lines.push(local(b.from) + "  " + bzSpeed(b));
-    lines.push("After " + local(last.to) + ": not visible yet");
+    const travel = r.l1 && r.l1.speed ? Math.round(DIST_KM / r.l1.speed / 60) : null;
+    lines.push("After " + local(last.to) + ": not visible yet" +
+      (travel ? " (wind reaches Earth ~" + travel + " min after the satellites see it)" : ""));
   }
   lines.push("");
   lines.push("Storm: " + stormWord(state) + " · " + kpText(r));
@@ -470,6 +516,7 @@ function formatSimple(r, warn, state, now) {
     lines.push("⚠️ Satellite data is " + Math.round((now - r.dataTime) / 60000) + " min old");
   }
   if (r.backup) lines.push("🔁 Main satellite feed is down · using backup " + r.source);
+  if (r.filled && r.filled.length) lines.push("➕ Gaps filled from " + r.filled.join("/"));
   return lines.join("\n");
 }
 
@@ -506,6 +553,7 @@ function formatStatus(r, warn, state, now) {
                   : "NOAA: no active K-index warning");
   if (r.dataTime) {
     lines.push("Data: " + Math.round((now - r.dataTime) / 60000) + " min old (" + r.source + (r.backup ? ", backup" : "") +
+               (r.filled && r.filled.length ? ", gaps filled from " + r.filled.join("/") : "") +
                ", " + utcHM(r.dataTime) + " UTC)");
   }
   return lines.join("\n");
